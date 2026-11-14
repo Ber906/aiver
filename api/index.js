@@ -26,13 +26,14 @@ pre{width:100%;max-height:180px;overflow:auto;margin:0;text-align:left;font:12px
 var $=function(i){return document.getElementById(i)};
 async function post(u,b){var r=await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})});var j=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 $('login').onsubmit=async function(e){e.preventDefault();$('err').textContent='';try{await post('/api/login',{password:$('pw').value});location.reload()}catch(x){$('err').textContent=x.message}};
-var opening=false,openedAt=0;
+var opening=false,openedAt=0,kicked=false;
 async function tick(){
   var s;try{var r=await fetch('/api/status',{cache:'no-store'});if(r.status===401){location.reload();return}s=await r.json()}catch(e){s={phase:'error',message:e.message}}
   var say={idle:'Creating your sandbox...',stopped:'Waking your sandbox...',pending:'Starting the sandbox...',snapshotting:'Saving the sandbox...',stopping:'Stopping, one moment...',booting:'Power Agent is starting. The very first start takes a few minutes while it downloads and builds FreeLLMAPI.',ready:'Ready. Opening...',failed:'The sandbox failed to start. Retrying...',aborted:'The sandbox was aborted. Retrying...',error:s.message||'Something went wrong'}[s.phase]||s.phase;
   $('msg').textContent=say;var L=s.log||[];$('log').textContent=L.join('\\n');$('log').classList.toggle('hidden',!L.length);
   $('left').textContent=s.minutesLeft!=null?('Session time left: about '+s.minutesLeft+' min'):'';
   if(s.phase==='ready'){location.replace(s.url);return}
+  if(s.phase==='booting'&&!kicked&&!opening){kicked=true;opening=true;openedAt=Date.now();post('/api/open').catch(function(){}).finally(function(){opening=false})}
   if(['idle','stopped','failed','aborted'].indexOf(s.phase)>-1&&!opening&&Date.now()-openedAt>30000){opening=true;openedAt=Date.now();post('/api/open').catch(function(x){$('msg').textContent=x.message}).finally(function(){opening=false})}
   setTimeout(tick,2500)}
 if(document.body.dataset.authed==='1'){$('boot').classList.remove('hidden');tick()}else{$('login').classList.remove('hidden')}
