@@ -1,0 +1,10 @@
+{
+  "name": "power-agent-vercel-launcher",
+  "private": true,
+  "type": "module",
+  "description": "Tiny Vercel project that starts Power Agent inside a persistent Vercel Sandbox and sends you to it.",
+  "dependencies": {
+    "@vercel/sandbox": "latest"
+  },
+  "engines": { "node": "24.x" }
+}
