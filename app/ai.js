@@ -219,10 +219,39 @@ const git = (args) => run('git', args, { quiet: true });
 const npm = (args) => run(IS_WIN ? 'npm.cmd' : 'npm', args);
 const headCommit = () => git(['rev-parse', 'HEAD']);
 
+// A checkout is only usable if it is its own git repo AND HEAD resolves. A folder with a leftover/empty
+// .git (interrupted clone, copied project, host restart mid-clone) makes `git rev-parse HEAD` exit 128.
+async function repoHealthy() {
+  if (!fs.existsSync(path.join(CFG.dir, '.git'))) return false;
+  try {
+    await git(['rev-parse', '--verify', '--quiet', 'HEAD']);
+    const top = await git(['rev-parse', '--show-toplevel']);
+    return fs.realpathSync(top) === fs.realpathSync(CFG.dir);
+  } catch { return false; }
+}
 async function ensureClone() {
-  if (fs.existsSync(path.join(CFG.dir, '.git'))) return;
+  if (await repoHealthy()) return;
+  // Keep any existing FreeLLMAPI data (API keys, DB) while the broken folder is replaced.
+  let rescued = null;
+  const dataDir = path.join(CFG.dir, 'server', 'data');
+  if (fs.existsSync(dataDir)) {
+    rescued = path.join(HOME, 'freellmapi-data-rescue');
+    fs.rmSync(rescued, { recursive: true, force: true });
+    try { fs.cpSync(dataDir, rescued, { recursive: true }); } catch { rescued = null; }
+  }
+  if (fs.existsSync(CFG.dir)) warn('FreeLLMAPI folder is not a valid git checkout (interrupted or empty clone). Re-cloning...');
+  // Clone into a temp folder, then rename, so an interrupted clone can never leave a half-made repo behind.
+  const tmp = `${CFG.dir}.cloning`;
+  fs.rmSync(tmp, { recursive: true, force: true });
   log(`Cloning ${CFG.repo} ...`);
-  await run('git', ['clone', '--branch', CFG.branch, CFG.repo, CFG.dir], { cwd: HOME });
+  try { await run('git', ['clone', '--branch', CFG.branch, CFG.repo, tmp], { cwd: HOME }); }
+  catch (e) { fs.rmSync(tmp, { recursive: true, force: true }); throw e; }
+  fs.rmSync(CFG.dir, { recursive: true, force: true });
+  fs.renameSync(tmp, CFG.dir);
+  if (rescued) {
+    try { fs.cpSync(rescued, path.join(CFG.dir, 'server', 'data'), { recursive: true }); fs.rmSync(rescued, { recursive: true, force: true }); }
+    catch (e) { warn(`Could not restore FreeLLMAPI data from ${rescued}: ${e.message}`); }
+  }
 }
 function syncFreeLLMEnv() {
   // FreeLLMAPI stays private; the shared gateway owns the public port.
