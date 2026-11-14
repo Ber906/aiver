@@ -204,19 +204,21 @@ const STATE_FILE = path.join(DATA, 'launcher-state.json');
 const readState = () => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } };
 const writeState = (s) => fs.writeFileSync(STATE_FILE, JSON.stringify({ ...readState(), ...s }, null, 2));
 
-function run(cmd, args, { cwd = CFG.dir, quiet = false } = {}) {
+function run(cmd, args, { cwd = CFG.dir, quiet = false, tee = false, env = {} } = {}) {
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(cwd)) cwd = HOME;
-    const p = spawn(cmd, args, { cwd, env: process.env, shell: IS_WIN && cmd !== 'git', stdio: quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit' });
+    const piped = quiet || tee;
+    const p = spawn(cmd, args, { cwd, env: { ...process.env, ...env }, shell: IS_WIN && cmd !== 'git', stdio: piped ? ['ignore', 'pipe', 'pipe'] : 'inherit' });
     let out = '';
-    p.stdout?.on('data', (d) => (out += d));
-    p.stderr?.on('data', (d) => (out += d));
+    const keep = (d) => { out = (out + d).slice(-20000); };
+    p.stdout?.on('data', (d) => { keep(d); if (tee) process.stdout.write(d); });
+    p.stderr?.on('data', (d) => { keep(d); if (tee) process.stderr.write(d); });
     p.on('error', reject);
-    p.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`${cmd} ${args.join(' ')} exited with ${code}\n${out.slice(-1500)}`))));
+    p.on('close', (code) => (code === 0 ? resolve(out.trim()) : reject(new Error(`${cmd} ${args.join(' ')} exited with ${code}\n${out.slice(tee ? -6000 : -1500)}`))));
   });
 }
 const git = (args) => run('git', args, { quiet: true });
-const npm = (args) => run(IS_WIN ? 'npm.cmd' : 'npm', args);
+const npm = (args, opts = {}) => run(IS_WIN ? 'npm.cmd' : 'npm', args, { tee: true, ...opts });
 const headCommit = () => git(['rev-parse', 'HEAD']);
 
 // A checkout is only usable if it is its own git repo AND HEAD resolves. A folder with a leftover/empty
@@ -257,17 +259,77 @@ function syncFreeLLMEnv() {
   // FreeLLMAPI stays private; the shared gateway owns the public port.
   upsertEnv(path.join(CFG.dir, '.env'), { ENCRYPTION_KEY: CFG.encKey, PORT: String(CFG.freellmInternalPort), HOST: '127.0.0.1' });
 }
+// Fallback build: run each workspace's build on its own. `tsc` still writes JavaScript when it only reports
+// type errors (exit code 2), so that case is accepted when fresh output exists; Vite builds skip the type-check step.
+async function tolerantBuild(originalError) {
+  const t0 = Date.now() - 60000;
+  const newestFile = (dir) => {
+    let newest = 0;
+    const walk = (d, depth) => {
+      let entries = [];
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const f = path.join(d, e.name);
+        if (e.isDirectory()) { if (depth < 6) walk(f, depth + 1); }
+        else { try { newest = Math.max(newest, fs.statSync(f).mtimeMs); } catch { /* ignore */ } }
+      }
+    };
+    walk(dir, 0);
+    return newest;
+  };
+  let rootPkg;
+  try { rootPkg = JSON.parse(fs.readFileSync(path.join(CFG.dir, 'package.json'), 'utf8')); } catch { throw originalError; }
+  const raw = Array.isArray(rootPkg.workspaces) ? rootPkg.workspaces : (rootPkg.workspaces?.packages || []);
+  const spaces = [];
+  for (const w of raw) {
+    if (w.endsWith('/*')) {
+      const base = path.join(CFG.dir, w.slice(0, -2));
+      try { for (const e of fs.readdirSync(base, { withFileTypes: true })) if (e.isDirectory()) spaces.push(`${w.slice(0, -2)}/${e.name}`); } catch { /* ignore */ }
+    } else if (!w.includes('*')) spaces.push(w);
+  }
+  if (!spaces.length) throw originalError;
+  const rank = (w) => (/shared|common|core|types/i.test(w) ? 0 : /server|api|backend/i.test(w) ? 1 : 2);
+  spaces.sort((a, b) => rank(a) - rank(b));
+  for (const w of spaces) {
+    const dir = path.join(CFG.dir, w);
+    let pkg;
+    try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); } catch { continue; }
+    const script = String(pkg.scripts?.build || '');
+    if (!script) continue;
+    log(`Building workspace ${w} ...`);
+    try { await npm(['run', 'build'], { cwd: dir }); continue; }
+    catch (e) {
+      if (/vite\s+build/.test(script)) {
+        warn(`${w}: build step failed; running the bundler directly without the type-check.`);
+        await run(IS_WIN ? 'npx.cmd' : 'npx', ['vite', 'build'], { cwd: dir, tee: true });
+        continue;
+      }
+      if (/\btsc\b/.test(script) && newestFile(path.join(dir, 'dist')) >= t0) {
+        warn(`${w}: TypeScript reported type errors but JavaScript was still emitted. Continuing.`);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
 async function installAndBuild(force = false) {
   const head = await headCommit();
   const distOk = fs.existsSync(path.join(CFG.dir, 'server', 'dist', 'index.js'));
   if (!force && distOk && readState().builtCommit === head) { log(`FreeLLMAPI ${head.slice(0, 7)} already built.`); return; }
   log(`Installing FreeLLMAPI dependencies (${head.slice(0, 7)}). First time takes a few minutes...`);
   const lock = fs.existsSync(path.join(CFG.dir, 'package-lock.json'));
-  await npm(['install', '--package-lock-only', '--ignore-scripts', '--save-dev', 'concurrently@10.0.7', '--no-audit', '--no-fund']);
-  try { await npm([lock ? 'ci' : 'install', '--no-audit', '--no-fund']); }
-  catch { warn('npm ci failed, retrying with npm install...'); await npm(['install', '--no-audit', '--no-fund']); }
+  // Hosts like Vercel/Render set NODE_ENV=production, which makes npm SKIP devDependencies (typescript, @types/*).
+  // The build needs them, so always include dev dependencies for the install step.
+  const DEV = '--include=dev';
+  await npm(['install', '--package-lock-only', '--ignore-scripts', '--save-dev', 'concurrently@10.0.7', '--no-audit', '--no-fund', DEV]);
+  try { await npm([lock ? 'ci' : 'install', '--no-audit', '--no-fund', DEV]); }
+  catch { warn('npm ci failed, retrying with npm install...'); await npm(['install', '--no-audit', '--no-fund', DEV]); }
   log('Building FreeLLMAPI...');
-  await npm(['run', 'build']);
+  try { await npm(['run', 'build']); }
+  catch (e) {
+    warn(`Full build failed (${e.message.split('\n')[0]}). Retrying one workspace at a time...`);
+    await tolerantBuild(e);
+  }
   if (!fs.existsSync(path.join(CFG.dir, 'server', 'dist', 'index.js'))) throw new Error('Build done but server/dist/index.js is missing (repo layout changed?).');
   writeState({ builtCommit: head, builtAt: new Date().toISOString() });
 }
