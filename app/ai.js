@@ -3705,6 +3705,38 @@ dialog .acts{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
   .dock{padding-left:10px;padding-right:10px}
   .ub{max-width:90%}
 }
+/* ---------- v2: thinking orb + polish ---------- */
+@property --ang{syntax:'<angle>';inherits:false;initial-value:0deg}
+@keyframes spinAng{to{--ang:360deg}}
+@keyframes swapin{from{opacity:0;filter:blur(6px);transform:translateY(5px)}to{opacity:1;filter:none;transform:none}}
+@keyframes ring2{0%{transform:scale(.88);opacity:.7}100%{transform:scale(1.45);opacity:0}}
+@keyframes eq1{0%,100%{background-size:3px 35%,3px 80%,3px 55%}50%{background-size:3px 90%,3px 40%,3px 100%}}
+@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-2.5%,2%,0) scale(1.1)}}
+
+.status{gap:12px;margin-top:20px;min-height:56px}
+.status .orb{width:44px;height:44px;flex:none;display:block;filter:drop-shadow(0 0 12px color-mix(in srgb,var(--accent) 38%,transparent))}
+.status .stx{font:560 15.5px/1.3 var(--display);letter-spacing:-.005em;padding:2px 0}
+.status .stx.swap{animation:shimmer 2.2s linear infinite,swapin .45s cubic-bezier(.2,.8,.2,1) both}
+.status .el{font:550 12px/1 var(--mono);padding:5px 8px;border-radius:9px;background:color-mix(in srgb,var(--accent) 10%,transparent);border:1px solid color-mix(in srgb,var(--accent) 24%,transparent);color:var(--accent);opacity:1}
+.status .el:empty{display:none}
+
+.live-tag i{width:14px;height:12px;border-radius:2px;animation:eq1 .9s ease-in-out infinite;background:linear-gradient(var(--accent),var(--accent)) 0 100%/3px 35% no-repeat,linear-gradient(var(--violet),var(--violet)) 5.5px 100%/3px 80% no-repeat,linear-gradient(var(--accent),var(--accent)) 11px 100%/3px 55% no-repeat}
+
+.composer{position:relative}
+.composer::before{content:'';position:absolute;inset:-1px;border-radius:inherit;padding:1.5px;pointer-events:none;opacity:0;transition:opacity .45s;background:conic-gradient(from var(--ang),transparent 0 52%,var(--accent) 70%,var(--violet) 86%,transparent 100%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
+.main:has(#liveTag:not(.hidden)) .composer::before{opacity:1;animation:spinAng 2.4s linear infinite}
+.main:has(#liveTag:not(.hidden)) .composer{box-shadow:0 10px 56px color-mix(in srgb,var(--accent) 16%,transparent),0 10px 40px rgba(2,6,20,.22)}
+.main:has(#liveTag:not(.hidden))::before{animation:drift 14s ease-in-out infinite alternate}
+.send.stop{position:relative}
+.send.stop::after{content:'';position:absolute;inset:-3px;border-radius:50%;border:2px solid color-mix(in srgb,var(--accent) 70%,transparent);animation:ring2 1.7s ease-out infinite;pointer-events:none}
+
+.main:not(.empty-mode) .msgs{-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 16px,#000 calc(100% - 20px),transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 16px,#000 calc(100% - 20px),transparent 100%)}
+.ub{background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 11%,transparent),color-mix(in srgb,var(--violet) 17%,transparent));border-color:color-mix(in srgb,var(--violet) 32%,var(--border));box-shadow:0 6px 22px rgba(2,6,20,.14)}
+.tool{border-radius:12px;transition:background .15s}
+.tool[open]{background:color-mix(in srgb,var(--elev) 72%,transparent)}
+.think.live .think-body{border-left-color:var(--accent)}
+.btn:active,.chip-btn:active,.circle-btn:active,.icon-btn:active,.newchat:active,.chip:active{transform:scale(.96)}
+.send:active{transform:scale(.92)}
 @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 `;
 
@@ -4298,14 +4330,65 @@ function clientApp() {
     ctxChars = chars; meter();
   }
 
+  // ---- "Thinking" orb: a swarm of dots that keeps morphing between shapes (canvas, ~46 particles, stops by itself when removed) ----
+  const THINK_WORDS = ['Thinking', 'Reasoning', 'Mapping it out', 'Weighing options', 'Connecting the dots', 'Double-checking'];
+  function makeOrb(cv, size) {
+    const g = cv.getContext && cv.getContext('2d'); if (!g) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = cv.height = Math.round(size * dpr); cv.style.width = cv.style.height = size + 'px'; g.scale(dpr, dpr);
+    const cs = getComputedStyle(document.documentElement);
+    const rgb = (v, d) => { const m = /^#?([0-9a-f]{6})$/i.exec(String(v || '').trim()); if (!m) return d; const n = parseInt(m[1], 16); return [n >> 16, (n >> 8) & 255, n & 255]; };
+    const A = rgb(cs.getPropertyValue('--accent'), [94, 234, 212]), B = rgb(cs.getPropertyValue('--violet'), [139, 123, 255]), C = [122, 162, 255];
+    const mix = (p, q, k) => [p[0] + (q[0] - p[0]) * k, p[1] + (q[1] - p[1]) * k, p[2] + (q[2] - p[2]) * k];
+    const rampColor = (u) => (u < 0.5 ? mix(A, C, u * 2) : mix(C, B, (u - 0.5) * 2));
+    const N = 46, TAU = Math.PI * 2, HOLD = 1.5, MORPH = 1.0, CYC = HOLD + MORPH, R = size * 0.36;
+    const shapes = [
+      (u) => [Math.cos(u * TAU), Math.sin(u * TAU)],                                                      // ring
+      (u) => { const a = u * TAU, r = 0.3 + 0.7 * Math.abs(Math.cos(2.5 * a)); return [r * Math.cos(a), r * Math.sin(a)]; }, // five-petal bloom
+      (u) => { const a = u * TAU; return [Math.cos(a), 1.15 * Math.sin(a) * Math.cos(a)]; },               // infinity
+      (u) => { const a = u * 4 * Math.PI, r = 0.12 + 0.88 * u; return [r * Math.cos(a), r * Math.sin(a)]; },   // spiral galaxy
+      (u) => { const a = u * TAU; return [Math.sin(3 * a + 1.2), Math.sin(2 * a)]; },                      // knot
+    ];
+    const ease = (k) => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+    const isLight = () => { const t = document.documentElement.dataset.theme; return t ? t === 'light' : matchMedia('(prefers-color-scheme: light)').matches; };
+    const px = (c) => (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0);
+    function draw(t) {
+      g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, size, size);
+      const i = Math.floor(t / CYC), ph = t - i * CYC, s0 = shapes[i % shapes.length], s1 = shapes[(i + 1) % shapes.length];
+      const k = ph < HOLD ? 0 : ease((ph - HOLD) / MORPH);
+      const rot = t * 0.55, cr = Math.cos(rot), sr = Math.sin(rot), breath = 1 + 0.07 * Math.sin(t * 2.4), mid = size / 2;
+      const glow = g.createRadialGradient(mid, mid, 0, mid, mid, mid);
+      glow.addColorStop(0, 'rgba(' + px(A) + ',' + (0.2 + 0.09 * Math.sin(t * 2.4)).toFixed(3) + ')'); glow.addColorStop(1, 'rgba(' + px(A) + ',0)');
+      g.fillStyle = glow; g.fillRect(0, 0, size, size);
+      g.globalCompositeOperation = isLight() ? 'source-over' : 'lighter';
+      for (let n = 0; n < N; n++) {
+        const u = n / N, p0 = s0(u), p1 = s1(u);
+        const x = p0[0] + (p1[0] - p0[0]) * k + 0.035 * Math.sin(t * 3 + n * 1.7), y = p0[1] + (p1[1] - p0[1]) * k + 0.035 * Math.cos(t * 2.6 + n * 2.3);
+        const wave = 0.5 + 0.5 * Math.sin(t * 3.2 - u * TAU * 2);
+        g.fillStyle = 'rgba(' + px(rampColor((u + t * 0.08) % 1)) + ',' + (0.35 + 0.65 * wave).toFixed(3) + ')';
+        g.beginPath(); g.arc(mid + (x * cr - y * sr) * R * breath, mid + (x * sr + y * cr) * R * breath, size * (0.03 + 0.036 * wave), 0, TAU); g.fill();
+      }
+    }
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) { draw(0.8); return; }
+    const t0 = performance.now();
+    const frame = (now) => { if (!cv.isConnected) return; draw(Math.max(0, (now - t0) / 1000)); requestAnimationFrame(frame); }; // rAF timestamps can precede t0 on the first frame
+    requestAnimationFrame(frame);
+  }
+
   // A "turn" is everything the agent does for one message. It is built purely from server events, so the same code
   // renders a live answer and a replay after a refresh.
   function createTurn(startedAt, skipUser) {
-    const status = el('div', 'status', '<span class="sp">' + ic('orbit') + '</span><span class="stx">Thinking</span><span class="el"></span>');
+    const status = el('div', 'status', '<canvas class="orb" aria-hidden="true"></canvas><span class="stx">Thinking</span><span class="el"></span>');
     msgs.append(status); scroll(true);
+    makeOrb(status.querySelector('.orb'), innerWidth < 520 ? 48 : 54);
     const t0 = startedAt || Date.now();
-    const tick = setInterval(() => { const s = Math.floor((Date.now() - t0) / 1000); status.querySelector('.el').textContent = s >= 4 ? s + 's' : ''; }, 1000);
-    const setStatus = (t) => { status.querySelector('.stx').textContent = t; };
+    let base = 'Thinking', wi = 0, ticks = 0;
+    const showText = (t) => { const x = status.querySelector('.stx'); if (!x || x.textContent === t) return; x.textContent = t; x.classList.remove('swap'); void x.offsetWidth; x.classList.add('swap'); };
+    const tick = setInterval(() => {
+      const secs = Math.floor((Date.now() - t0) / 1000); status.querySelector('.el').textContent = secs >= 4 ? secs + 's' : '';
+      if (base === 'Thinking' && ++ticks % 3 === 0) { wi = (wi + 1) % THINK_WORDS.length; showText(THINK_WORDS[wi]); } // idle thinking: rotate the wording
+    }, 1000);
+    const setStatus = (t) => { base = t; showText(t === 'Thinking' ? THINK_WORDS[wi] : t); };
     const place = (node) => { msgs.insertBefore(node, status); scroll(); };
     let bot = null, grp = null, skip = !!skipUser; const live = new Map();
     let pendingDelta = '', paintFrame = 0;
