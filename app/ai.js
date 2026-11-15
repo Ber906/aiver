@@ -22,6 +22,8 @@
  *             model failover, loop detection, context compaction and parallel tool calls
  *  UI         Original "Lagoon" design (dark/light, aurora canvas, gradient brand, live tool steps, artifact panel
  *             that RUNS generated HTML/video, file manager, mobile-first, drag-drop + paste)
+ *  LIVE APP   Preview panel for RUNNING dev servers (vite, next, express, flask, python -m http.server...): globe button,
+ *             port picker, proxied through the gateway at /power-agent-app/<token>/<port>/ (HTTP + WebSocket/HMR)
  *  PERSISTENT Answers run as SERVER-SIDE background runs. Refresh, close the tab, switch chats or lose signal and the
  *             agent keeps working; the page re-attaches, replays the turn and follows it live. Logins survive restarts,
  *             stray errors never crash the server, and auto-update waits until no answer is running.
@@ -2492,7 +2494,7 @@ Now: ${new Date().toString()}
 ## Persistence and capability
 14. Never stop at suggestions like "you could do X". Do X, then verify it.
 15. Giving up is not an option. If something is missing (a browser, ffmpeg, a library, a CLI), install it: call env_info, then install_package (it picks apt/pkg/brew/dnf/pip/npm and has a multi-route headless Chromium setup). If one route fails, try the next: another package, pip vs npm, a pure Node/Python implementation, a prebuilt binary via http_request. Never answer "this device cannot do X" and never hand the work back as manual steps. Deliver exactly what was asked (a real MP4 file, not an HTML substitute) and verify it exists and is valid (ls -l, ffprobe).
-16. Start dev servers with background=true and test them. Everything under the workspace is served live at /power-agent/files/<path>: link files and show generated images with markdown. HTML previews run in an isolated sandbox (scripts work; browser storage is restricted).
+16. Start dev servers with background=true and test them. Everything under the workspace is served live at /power-agent/files/<path>: link files and show generated images with markdown. HTML previews run in an isolated sandbox (scripts work; browser storage is restricted). A dev server you start in the background can be opened by the user in the Live app panel (globe button): it must listen on 127.0.0.1 or 0.0.0.0, and it is shown under a sub-path, so prefer relative URLs, and hash routing (HashRouter, #/page) over path routing, because the page path starts with a prefix.
 17. You can extend yourself: define_tool creates a persistent custom tool for a missing capability, and mcp_add connects an MCP server (browser automation, databases, ...). Their tools appear on the next step.
 18. When you learn something durable about the user or project, call remember. Never store secrets.
 19. Before a tool call, say in one short sentence what you are about to do, like a teammate narrating their work.
@@ -2998,6 +3000,185 @@ function startPreviewServer() {
     server.listen(CFG.previewPort, CFG.agentHost, () => { previewUp = true; resolve(server); });
   });
 }
+// ---------------- live app preview (dev servers) ----------------
+// BEGIN LIVE APP
+// Shows a dev server the agent started (vite, next, express, flask, python -m http.server...) inside the preview panel.
+// The public gateway proxies /power-agent-app/<token>/<port>/... to 127.0.0.1:<port>. Same isolation as the file preview:
+// the iframe has an opaque origin, the URL carries a per-process secret, cookies are stripped in both directions, and the
+// ports Power Agent itself uses are refused. Because the app lives under a sub-path, root-absolute URLs are repaired
+// (HTML/CSS/JS rewriting plus a small shim for fetch, XHR, WebSocket, EventSource and src/href setters).
+const APP_PREFIX = '/power-agent-app';
+const appRoot = (port) => `${APP_PREFIX}/${PREVIEW_TOKEN}/${port}`;
+const PREVIEW_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock allow-downloads; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; style-src * data: blob: 'unsafe-inline'; script-src * data: blob: 'unsafe-inline' 'unsafe-eval'; font-src * data: blob:";
+const appPortOk = (n) => Number.isInteger(n) && n >= 1 && n <= 65535 && ![CFG.port, CFG.freellmInternalPort, CFG.agentPort, CFG.previewPort].includes(n);
+function appTarget(rawUrl) {
+  let u; try { u = new URL(rawUrl, 'http://gateway.local'); } catch { return null; }
+  const m = u.pathname.match(/^\/power-agent-app\/([^/]+)\/(\d{1,5})(\/.*)?$/);
+  if (!m || !safeEq(m[1], PREVIEW_TOKEN)) return null;
+  const port = Number(m[2]);
+  return appPortOk(port) ? { port, rest: (m[3] || '/') + u.search, bare: !m[3], search: u.search } : null;
+}
+// Runs in the preview page (ES5, serialized with toString). Repairs requests that would otherwise leave the app's sub-path.
+function appShim(ROOT, PORT) {
+  var BASE = ROOT + '/' + PORT, H = location.host, P = location.protocol;
+  var LOCAL = /^(?:https?|wss?):\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d+)([\/?#].*)?$/i;
+  function norm(u) { // returns a root-relative path under the gateway, or null when the URL needs no change
+    u = String(u);
+    var s = /^(?:https?|wss?):/i.exec(u), pre = '//' + H;
+    // the page's own host first: when Power Agent itself is opened as 127.0.0.1:<port>, that is not "another app"
+    if (s && u.indexOf(pre + '/') === s[0].length) { var p = u.slice(s[0].length + pre.length); return p.indexOf(ROOT + '/') === 0 ? null : BASE + p; }
+    var m = LOCAL.exec(u);
+    if (m) { var r = m[2] || '/'; if (r.charAt(0) !== '/') r = '/' + r; return ROOT + '/' + m[1] + r; }
+    if (u.charAt(0) === '/' && u.charAt(1) !== '/') return (u.indexOf(ROOT + '/') === 0) ? null : BASE + u;
+    return null;
+  }
+  function fix(u) { if (typeof u !== 'string') return u; var n = norm(u); return n === null ? u : n; }
+  function fixWs(u) { var n = norm(u); return n === null ? String(u) : (P === 'https:' ? 'wss://' : 'ws://') + H + n; }
+  try { var of = window.fetch; if (of) window.fetch = function (i, o) { try { if (typeof i === 'string') i = fix(i); else if (typeof URL !== 'undefined' && i instanceof URL) i = fix(i.href); else if (typeof Request !== 'undefined' && i instanceof Request) { var n = fix(i.url); if (n !== i.url) i = new Request(n, i); } } catch (e) {} return of.call(this, i, o); }; } catch (e) {}
+  try { var oo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function (m, u) { var a = [].slice.call(arguments); try { a[1] = fix(typeof u === 'string' ? u : (u && u.href) || String(u)); } catch (e) {} return oo.apply(this, a); }; } catch (e) {}
+  try { ['pushState', 'replaceState'].forEach(function (k) { var oh = History.prototype[k]; History.prototype[k] = function (st, t, u) { try { if (typeof u === 'string') u = fix(u); } catch (e) {} return oh.call(this, st, t, u); }; }); } catch (e) {}
+  try { if (navigator.sendBeacon) { var sb = navigator.sendBeacon; navigator.sendBeacon = function (u, d) { return sb.call(navigator, fix(String(u)), d); }; } } catch (e) {}
+  try { var OE = window.EventSource; if (OE) { window.EventSource = function (u, c) { return new OE(fix(String(u)), c); }; window.EventSource.prototype = OE.prototype; ['CONNECTING', 'OPEN', 'CLOSED'].forEach(function (k) { window.EventSource[k] = OE[k]; }); } } catch (e) {}
+  try { var OW = window.WebSocket; if (OW) { window.WebSocket = function (u, p) { u = fixWs(u); return p === undefined ? new OW(u) : new OW(u, p); }; window.WebSocket.prototype = OW.prototype; ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { window.WebSocket[k] = OW[k]; }); } } catch (e) {}
+  try { var sa = Element.prototype.setAttribute; Element.prototype.setAttribute = function (n, v) { if (typeof v === 'string' && /^(src|href|action|poster|data|formaction)$/i.test(n)) v = fix(v); return sa.call(this, n, v); }; } catch (e) {}
+  [['HTMLImageElement', 'src'], ['HTMLScriptElement', 'src'], ['HTMLLinkElement', 'href'], ['HTMLSourceElement', 'src'], ['HTMLMediaElement', 'src'], ['HTMLIFrameElement', 'src'], ['HTMLAnchorElement', 'href']].forEach(function (a) {
+    try {
+      var C = window[a[0]], d = Object.getOwnPropertyDescriptor(C.prototype, a[1]);
+      if (d && d.set) Object.defineProperty(C.prototype, a[1], { get: d.get, set: function (v) { d.set.call(this, typeof v === 'string' ? fix(v) : v); }, configurable: true, enumerable: d.enumerable });
+    } catch (e) {}
+  });
+}
+const APP_PATH_LEAD = '(?!\\/|power-agent-app\\/)';
+const APP_ATTR_RE = new RegExp('(\\s(?:src|href|action|poster|data-src|formaction)\\s*=\\s*)(["\'])\\/' + APP_PATH_LEAD, 'gi');
+const APP_URL_RE = new RegExp('url\\(\\s*(["\']?)\\/' + APP_PATH_LEAD, 'gi');
+const APP_IMPORT_RE = new RegExp('(\\bfrom\\s*|\\bimport\\s*\\(?\\s*)(["\'])\\/' + APP_PATH_LEAD, 'g');
+const APP_CSS_IMPORT_RE = new RegExp('@import\\s+(["\'])\\/' + APP_PATH_LEAD, 'gi');
+function appRewrite(kind, text, port) {
+  const R = appRoot(port) + '/';
+  const urls = (s) => s.replace(APP_URL_RE, (_, q) => 'url(' + q + R);
+  if (kind === 'css') return urls(text).replace(APP_CSS_IMPORT_RE, (_, q) => '@import ' + q + R);
+  const imports = (s) => s.replace(APP_IMPORT_RE, (_, a, q) => a + q + R);
+  if (kind === 'js') {
+    let t = imports(text);
+    // Vite's HMR client builds its own URLs from a base constant: point it at the proxied sub-path
+    t = t.replace(/\bconst base = (["'])\/\1 \|\| ['"]\/['"]/, () => 'const base = ' + JSON.stringify(R) + " || '/'");
+    if (t.includes('__vite__css')) t = urls(t);
+    return t;
+  }
+  const html = imports(urls(text.replace(APP_ATTR_RE, (_, a, q) => a + q + R)));
+  const inject = STORAGE_SHIM + '<script>(' + appShim.toString() + ')(' + JSON.stringify(`${APP_PREFIX}/${PREVIEW_TOKEN}`) + ',' + port + ');</script>';
+  const m = /<head[^>]*>/i.exec(html);
+  return m ? html.slice(0, m.index + m[0].length) + inject + html.slice(m.index + m[0].length) : inject + html;
+}
+function appDecode(buf, enc) {
+  const zlib = require('node:zlib');
+  if (enc.includes('br')) return zlib.brotliDecompressSync(buf);
+  if (enc.includes('gzip')) return zlib.gunzipSync(buf);
+  if (enc.includes('deflate')) return zlib.inflateSync(buf);
+  return buf;
+}
+function appLocation(loc, port) {
+  if (/^\/(?!\/)/.test(loc)) return appRoot(port) + loc;
+  const m = /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d+)(\/.*)?$/i.exec(loc);
+  return m && appPortOk(Number(m[1])) ? appRoot(Number(m[1])) + (m[2] || '/') : loc;
+}
+const appDownPage = (port) => `<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark"><body style="font:15px/1.5 system-ui,sans-serif;padding:28px;max-width:34em"><h3>Nothing is answering on port ${port}</h3><p>Start the dev server in the background (it must listen on 127.0.0.1 or 0.0.0.0), then press reload.</p></body>`;
+const APP_DROP_RES = ['connection', 'keep-alive', 'proxy-connection', 'upgrade', 'set-cookie', 'x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy', 'access-control-allow-origin', 'access-control-allow-credentials', 'strict-transport-security', 'etag', 'last-modified'];
+function proxyApp(req, res) {
+  const t = appTarget(req.url);
+  if (!t) return send(res, 404, 'Not found');
+  if (t.bare) { res.writeHead(302, { location: appRoot(t.port) + '/' + t.search }); return res.end(); }
+  if (req.method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': '*', 'access-control-allow-headers': '*', 'access-control-max-age': '600' }); return res.end(); }
+  const headers = { ...req.headers, host: `127.0.0.1:${t.port}`, 'x-forwarded-host': req.headers['x-forwarded-host'] || req.headers.host || '', 'x-forwarded-proto': req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http') };
+  for (const h of ['cookie', 'referer', 'accept-encoding', 'if-none-match', 'if-modified-since', 'connection', 'keep-alive', 'proxy-connection', 'upgrade']) delete headers[h];
+  if (headers.origin) headers.origin = `http://127.0.0.1:${t.port}`; // dev servers (vite, next, csrf middleware) reject a "null" origin
+  const up = http.request({ hostname: '127.0.0.1', port: t.port, method: req.method, path: t.rest, headers }, (r) => {
+    const h = { ...r.headers };
+    for (const k of APP_DROP_RES) delete h[k];
+    Object.assign(h, CORS); h['cache-control'] = 'no-store';
+    if (h.location) h.location = appLocation(String(h.location), t.port);
+    const ct = String(h['content-type'] || '').toLowerCase();
+    const kind = /^text\/html\b/.test(ct) ? 'html' : /^text\/css\b/.test(ct) ? 'css' : /(?:java|ecma)script/.test(ct) ? 'js' : '';
+    if (kind === 'html') h['content-security-policy'] = PREVIEW_CSP;
+    const status = r.statusCode || 502;
+    if (!kind || req.method === 'HEAD' || status === 204 || status === 206 || status === 304 || Number(h['content-length'] || 0) > 6e6) { res.writeHead(status, h); return r.pipe(res); }
+    const chunks = [];
+    r.on('data', (c) => chunks.push(c));
+    r.on('error', () => res.destroy());
+    r.on('end', () => {
+      let buf = Buffer.concat(chunks);
+      try {
+        const enc = String(h['content-encoding'] || '').toLowerCase();
+        if (enc) { buf = appDecode(buf, enc); delete h['content-encoding']; }
+        buf = Buffer.from(appRewrite(kind, buf.toString('utf8'), t.port), 'utf8');
+      } catch { /* undecodable body: pass it through untouched */ }
+      delete h['transfer-encoding']; h['content-length'] = buf.length;
+      res.writeHead(status, h); res.end(buf);
+    });
+  });
+  up.on('error', (e) => {
+    if (res.headersSent) return res.destroy(e);
+    res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...CORS });
+    res.end(appDownPage(t.port));
+  });
+  req.once('aborted', () => up.destroy());
+  res.once('close', () => { if (!res.writableEnded) up.destroy(); });
+  req.pipe(up);
+}
+// WebSocket / HMR: a raw tunnel to the dev server (the gateway had no upgrade handling before)
+function appUpgrade(req, socket, head) {
+  const t = appTarget(req.url);
+  if (!t) return socket.destroy();
+  const up = net.connect(t.port, '127.0.0.1');
+  up.on('error', () => socket.destroy());
+  socket.on('error', () => up.destroy());
+  socket.on('close', () => up.destroy());
+  up.on('close', () => socket.destroy());
+  up.on('connect', () => {
+    const lines = [`${req.method} ${t.rest} HTTP/1.1`];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const k = req.rawHeaders[i], lk = k.toLowerCase();
+      if (lk === 'host') lines.push(`Host: 127.0.0.1:${t.port}`);
+      else if (lk === 'origin') lines.push(`Origin: http://127.0.0.1:${t.port}`);
+      else if (lk !== 'cookie' && lk !== 'referer') lines.push(`${k}: ${req.rawHeaders[i + 1]}`);
+    }
+    up.write(lines.join('\r\n') + '\r\n\r\n');
+    if (head && head.length) up.write(head);
+    up.pipe(socket); socket.pipe(up);
+  });
+}
+// Which local ports serve HTTP right now? Candidates come from background jobs' output, the OS listener table and common dev ports.
+const probeHttp = (port) => new Promise((resolve) => {
+  const r = http.request({ hostname: '127.0.0.1', port, method: 'GET', path: '/', timeout: 1500, headers: { accept: 'text/html', host: `127.0.0.1:${port}` } }, (x) => { const s = x.statusCode || 0; x.resume(); x.destroy(); resolve(s); });
+  r.on('timeout', () => { r.destroy(); resolve(0); });
+  r.on('error', () => resolve(0));
+  r.end();
+});
+async function listDevApps() {
+  const cand = new Map(); // port -> label of the background job that mentioned it
+  for (const j of jobs.values()) {
+    if (j.done) continue;
+    const re = /(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]|\[::\]):(\d{2,5})|\bport\s*(?:is\s*|:\s*|=\s*)?(\d{2,5})\b/gi;
+    for (const m of String(j.out || '').matchAll(re)) { const n = Number(m[1] || m[2]); if (appPortOk(n)) cand.set(n, String(j.command).replace(/\s+/g, ' ').slice(0, 40)); }
+  }
+  let listening = 0;
+  const loop = /^(?:0{8}|0{32}|0100007F|0{24}01000000|0{16}FFFF00000100007F)$/i;
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let txt = ''; try { txt = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    for (const line of txt.split('\n').slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c[3] !== '0A' || !c[1]) continue;
+      const [addr, hex] = c[1].split(':');
+      const n = parseInt(hex, 16);
+      if (loop.test(addr) && n >= 1024 && appPortOk(n)) { listening++; if (!cand.has(n)) cand.set(n, ''); }
+    }
+  }
+  if (!listening) for (const n of [3000, 3001, 3002, 4000, 4173, 4200, 5000, 5173, 5174, 5500, 8000, 8001, 8888, 9000]) if (appPortOk(n) && !cand.has(n)) cand.set(n, '');
+  const ports = [...cand.keys()].slice(0, 60);
+  const status = await Promise.all(ports.map(probeHttp));
+  return ports.map((port, i) => ({ port, status: status[i], job: cand.get(port) })).filter((a) => a.status > 0).sort((a, b) => (!!b.job - !!a.job) || a.port - b.port); // the agent's own background jobs first
+}
+// END LIVE APP
 const send = (res, code, data, headers = {}) => {
   const isObj = typeof data === 'object' && !Buffer.isBuffer(data);
   res.writeHead(code, { 'content-type': isObj ? 'application/json' : 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...headers });
@@ -3133,6 +3314,12 @@ function startAgentServer() {
         'pa_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
       ] }); }
 
+      if (p === '/api/apps' && req.method === 'GET') return send(res, 200, { apps: await listDevApps() });
+      if (p === '/api/app' && req.method === 'GET') {
+        const port = Number(new URL(req.url, 'http://x').searchParams.get('port'));
+        if (!appPortOk(port)) return send(res, 400, { error: 'Use a port from 1 to 65535 that Power Agent itself does not use.' });
+        return send(res, 200, { port, url: `${publicBase(req)}${appRoot(port)}/` });
+      }
       if (p === '/api/preview' && req.method === 'GET') {
         const f = wsPath(new URL(req.url, 'http://x').searchParams.get('path') || '');
         if (!exists(f)) return send(res, 404, { error: 'Not found' });
@@ -3319,7 +3506,7 @@ function proxyTo(req, res, targetPort, targetHost, requestPath, preview = false)
     const responseHeaders = { ...upstreamRes.headers };
     for (const h of ['connection', 'keep-alive', 'proxy-connection', 'upgrade']) delete responseHeaders[h];
     if (preview && /^text\/html\b/i.test(responseHeaders['content-type'] || '')) {
-      responseHeaders['content-security-policy'] = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock allow-downloads; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; style-src * data: blob: 'unsafe-inline'; script-src * data: blob: 'unsafe-inline' 'unsafe-eval'; font-src * data: blob:";
+      responseHeaders['content-security-policy'] = PREVIEW_CSP;
     }
     const location = responseHeaders.location;
     if (location && /^https?:\/\//i.test(location)) {
@@ -3352,6 +3539,7 @@ function startUnifiedServer() {
     let targetPort = CFG.freellmInternalPort, targetHost = '127.0.0.1', requestPath = rawUrl, isPreview = false;
     const pathname = parsed.pathname;
     if (pathname === '/health' && (req.method === 'GET' || req.method === 'HEAD')) return send(res, 200, { ok: true });
+    if (pathname === APP_PREFIX || pathname.startsWith(`${APP_PREFIX}/`)) return proxyApp(req, res); // live app preview (dev servers)
     const previewPath = '/power-agent-preview';
     if (pathname === previewPath || pathname.startsWith(`${previewPath}/`)) {
       targetPort = CFG.previewPort; isPreview = true;
@@ -3363,6 +3551,7 @@ function startUnifiedServer() {
     }
     proxyTo(req, res, targetPort, targetHost, requestPath, isPreview);
   });
+  server.on('upgrade', appUpgrade); // WebSocket/HMR for the live app preview; other upgrades are closed as before
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(CFG.port, CFG.host, () => resolve(server));
@@ -3648,6 +3837,11 @@ body.dropping::after{content:'Drop files to attach';position:fixed;inset:12px;bo
 .pv-media img,.pv-media video{max-width:100%;max-height:100%;border-radius:12px}
 .pv-media .bot{align-self:flex-start;width:100%;margin:0}
 .pv-note{position:absolute;left:12px;right:12px;bottom:12px;padding:8px 12px;border-radius:12px;background:var(--elev);border:1px solid var(--border);font-size:13px;color:var(--text2)}
+.pv-appbar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);flex:none}
+.pv-appbar select,.pv-appbar input{height:32px;border-radius:9px;border:1px solid var(--border);background:var(--elev);color:var(--text);padding:0 10px;font:inherit;font-size:13.5px;min-width:0;outline:0}
+.pv-appbar select:focus,.pv-appbar input:focus{border-color:var(--accent)}
+#pvAppSel{flex:1}
+#pvPortIn{width:86px;flex:none}
 
 /* ---------- file manager ---------- */
 .fm{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);background:var(--bg);border-left:1px solid var(--border2);display:flex;flex-direction:column;z-index:120;box-shadow:var(--shadow)}
@@ -3816,6 +4010,7 @@ const BODY = `
     <button id="newChat" class="newchat" title="New chat"><span class="plus" data-ic="plus"></span><span class="lbl">New chat</span></button>
     <nav class="nav">
       <button id="openFiles" class="nav-item" title="Files"><span data-ic="folder"></span><span class="lbl">Files</span></button>
+      <button id="openApp" class="nav-item" title="Live app"><span data-ic="globe"></span><span class="lbl">Live app</span></button>
       <button id="openMem" class="nav-item" title="Memory"><span data-ic="bookmark"></span><span class="lbl">Memory</span></button>
     </nav>
     <div class="side-label">Recents</div>
@@ -3833,6 +4028,7 @@ const BODY = `
       <button id="menu" class="icon-btn only-mobile" data-ic="menu" aria-label="Open menu"></button>
       <div id="title" class="title">New chat</div>
       <span id="liveTag" class="live-tag hidden"><i></i>Working</span><span class="grow"></span>
+      <button id="appBtn" class="icon-btn" data-ic="globe" title="Live app" aria-label="Live app"></button>
       <button id="filesBtn" class="icon-btn" data-ic="folder" title="Files" aria-label="Files"></button>
       <button id="ctxBtn" class="ring-btn" title="Context usage"><svg viewBox="0 0 36 36"><circle class="ring-bg" cx="18" cy="18" r="15.9155"/><circle id="ringBar" class="ring-fg" cx="18" cy="18" r="15.9155" stroke-dasharray="0 100"/></svg></button>
     </header>
@@ -3863,13 +4059,18 @@ const BODY = `
 
   <aside id="pv" class="pv hidden">
     <header class="pv-top">
-      <div class="pv-title"><span data-ic="file"></span><b id="pvName"></b></div>
-      <div class="seg"><button id="pvTabPrev" class="on">Preview</button><button id="pvTabCode">Code</button></div>
+      <div class="pv-title"><span id="pvIcon" data-ic="file"></span><b id="pvName"></b></div>
+      <div class="seg" id="pvSeg"><button id="pvTabPrev" class="on">Preview</button><button id="pvTabCode">Code</button></div>
       <button id="pvReload" class="icon-btn" data-ic="refresh" title="Reload" aria-label="Reload"></button>
       <a id="pvOpen" class="icon-btn" data-ic="ext" target="_blank" rel="noopener" title="Open in new tab"></a>
       <a id="pvDl" class="icon-btn" data-ic="download" title="Download"></a>
       <button id="pvClose" class="icon-btn" data-ic="x" title="Close" aria-label="Close"></button>
     </header>
+    <div id="pvAppbar" class="pv-appbar hidden">
+      <select id="pvAppSel" aria-label="Running apps"></select>
+      <input id="pvPortIn" type="number" inputmode="numeric" min="1" max="65535" placeholder="port" aria-label="Port">
+      <button id="pvGo" type="button" class="btn sm">Go</button>
+    </div>
     <div class="pv-body">
       <iframe id="pvFrame" class="hidden" sandbox="allow-scripts allow-forms allow-popups allow-modals allow-pointer-lock allow-downloads" allow="autoplay; fullscreen; clipboard-write; gamepad; accelerometer; gyroscope" allowfullscreen></iframe>
       <div id="pvMedia" class="pv-media hidden"></div>
@@ -4223,6 +4424,15 @@ function clientApp() {
   }
   function artifactFor(g, name, args, output) {
     const paths = [];
+    const bg = name === 'run_command' ? /Started background job (\S+):/.exec(String(output || '')) : null;
+    if (bg && !artifacts.has('app:' + bg[1])) {
+      let a = {}; try { a = JSON.parse(args || '{}'); } catch (e) { /* partial */ }
+      if (/(dev|start|serve|server|vite|next|http\.server|flask|uvicorn|gunicorn|django|rails|streamlit|php|live-server|nodemon|node |bun |deno |python)/i.test(String(a.command || ''))) {
+        const c = el('button', 'art', '<span class="ai">' + ic('globe') + '</span><span class="at"><b>Live app</b><small>Server started \u00b7 Tap to preview</small></span>' + ic('chevR'));
+        c.type = 'button'; c.dataset.app = '1'; artifacts.set('app:' + bg[1], c);
+        (g.nextSibling && g.nextSibling.classList && g.nextSibling.classList.contains('art') ? g.nextSibling : g).after(c);
+      }
+    }
     const t = toolInfo(name, args);
     if (/^(create_file|write_file|apply_patch|multi_edit|edit_file)$/.test(name) && t.path) paths.push(t.path);
     if (name === 'screenshot') { const m = /\(\/files\/([^)]+)\)/.exec(output || ''); if (m) paths.push(decodeURIComponent(m[1])); }
@@ -4609,7 +4819,7 @@ function clientApp() {
   }
 
   // ---------- artifact / preview panel ----------
-  let pvPath = null, pvTab = 'prev';
+  let pvPath = null, pvTab = 'prev', pvMode = 'file', pvPort = 0, pvPoll = null;
   const setPvTabUi = (t) => { pvTab = t; $('pvTabPrev').classList.toggle('on', t === 'prev'); $('pvTabCode').classList.toggle('on', t === 'code'); };
   async function pvRender() {
     const p = pvPath, e = extOf(p), url = fileUrl(p);
@@ -4638,14 +4848,66 @@ function clientApp() {
     else if (e === 'md') { try { const t = await (await fetch(url)).text(); media.innerHTML = '<div class="bot"></div>'; media.firstChild.innerHTML = md(t); media.classList.remove('hidden'); } catch (x) { media.textContent = x.message; media.classList.remove('hidden'); } }
   }
   function openPreview(p, tab) {
+    pvMode = 'file'; pvPort = 0; stopAppPoll(); $('pvIcon').innerHTML = ic('file');
+    $('pvAppbar').classList.add('hidden'); $('pvSeg').classList.remove('hidden'); $('pvDl').classList.remove('hidden');
     pvPath = p; $('pvName').textContent = p.split('/').pop();
     $('pvOpen').href = fileUrl(p); $('pvDl').href = fileUrl(p) + '?download=1';
     $('pv').classList.remove('hidden'); $('fm').classList.add('hidden');
     setPvTabUi(tab || (PREVIEWABLE.test(extOf(p)) ? 'prev' : 'code')); pvRender();
   }
-  const closePreview = () => { $('pv').classList.add('hidden'); $('pvFrame').src = 'about:blank'; $('pvMedia').innerHTML = ''; pvPath = null; };
-  $('pvClose').onclick = closePreview; $('pvReload').onclick = () => pvPath && pvRender();
+  const closePreview = () => { $('pv').classList.add('hidden'); $('pvFrame').src = 'about:blank'; $('pvMedia').innerHTML = ''; pvPath = null; pvMode = 'file'; pvPort = 0; stopAppPoll(); };
+  $('pvClose').onclick = closePreview; $('pvReload').onclick = () => (pvMode === 'app' ? appReload() : pvPath && pvRender());
   $('pvTabPrev').onclick = () => { setPvTabUi('prev'); pvRender(); }; $('pvTabCode').onclick = () => { setPvTabUi('code'); pvRender(); };
+
+  // ---------- live app (dev server) preview ----------
+  const stopAppPoll = () => { if (pvPoll) { clearInterval(pvPoll); pvPoll = null; } };
+  function appNote(text) { const n = $('pvNote'); n.textContent = text || ''; n.classList.toggle('hidden', !text); }
+  async function appLoad(port) {
+    port = Number(port); if (!port) return;
+    try {
+      const j = await api('/api/app?port=' + port);
+      if (pvMode !== 'app') return;
+      pvPort = port; stopAppPoll();
+      $('pvName').textContent = 'Live app :' + port; $('pvPortIn').value = '';
+      $('pvOpen').href = j.url; $('pvFrame').src = j.url; $('pvFrame').classList.remove('hidden');
+      appNote('');
+    } catch (x) { appNote(x.message); }
+  }
+  async function appScan(want) {
+    let apps = [];
+    try { apps = (await api('/api/apps')).apps || []; } catch (x) { appNote(x.message); return; }
+    if (pvMode !== 'app') return;
+    const sel = $('pvAppSel'); sel.innerHTML = '';
+    if (pvPort && !apps.some((a) => a.port === pvPort)) apps.push({ port: pvPort, job: '' }); // keep a port that was typed in by hand
+    if (!apps.length) sel.append(new Option('No running app found', ''));
+    apps.forEach((a) => sel.append(new Option(':' + a.port + (a.job ? ' \u00b7 ' + a.job : ''), String(a.port))));
+    const pick = want || pvPort || (apps[0] && apps[0].port);
+    if (pick) { sel.value = String(pick); if (pick !== pvPort) await appLoad(pick); }
+    else appNote('Waiting for a dev server. Ask the agent to start one in the background, or type its port and press Go.');
+  }
+  async function openApp(port) {
+    pvMode = 'app'; pvPath = null; pvPort = 0; stopAppPoll();
+    $('pvName').textContent = 'Live app'; $('pvIcon').innerHTML = ic('globe');
+    $('pvSeg').classList.add('hidden'); $('pvDl').classList.add('hidden'); $('pvAppbar').classList.remove('hidden');
+    ['pvFrame', 'pvMedia', 'pvCode'].forEach((i) => $(i).classList.add('hidden')); $('pvFrame').src = 'about:blank';
+    $('pvOpen').removeAttribute('href');
+    $('pv').classList.remove('hidden'); $('fm').classList.add('hidden');
+    appNote('Looking for a running app...');
+    await appScan(port);
+    if (!pvPort && pvMode === 'app') { // the agent may still be starting the server: keep looking for about two minutes
+      let tries = 0;
+      pvPoll = setInterval(() => { if (pvMode !== 'app' || pvPort || ++tries > 40) return stopAppPoll(); appScan(); }, 3000);
+    }
+  }
+  async function appReload() {
+    await appScan(pvPort);
+    if (!pvPort) return;
+    const f = $('pvFrame'), u = f.src;
+    f.src = 'about:blank'; setTimeout(() => { if (pvMode === 'app') f.src = u; }, 40);
+  }
+  const appGo = () => { const v = Number($('pvPortIn').value); if (v >= 1 && v <= 65535) appLoad(v).then(() => appScan(v)); else appNote('Type a port from 1 to 65535.'); };
+  $('pvAppSel').onchange = () => { const v = $('pvAppSel').value; if (v) appLoad(v); };
+  $('pvGo').onclick = appGo; $('pvPortIn').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); appGo(); } };
 
   // ---------- file manager ----------
   let fmPath = '.', fmCur = null, fmDirty = false;
@@ -4802,9 +5064,12 @@ function clientApp() {
   msgs.addEventListener('click', (e) => {
     const t = e.target;
     const cp = t.closest('.copy'); if (cp) { navigator.clipboard?.writeText(cp.closest('pre').querySelector('code').textContent); cp.textContent = 'Copied'; setTimeout(() => (cp.textContent = 'Copy'), 1200); return; }
-    const art = t.closest('.art, a.artlink'); if (art && art.dataset.path) { e.preventDefault(); openPreview(art.dataset.path); }
+    const art = t.closest('.art, a.artlink');
+    if (art && art.dataset.app) { e.preventDefault(); openApp(); return; }
+    if (art && art.dataset.path) { e.preventDefault(); openPreview(art.dataset.path); }
   });
   $('openFiles').onclick = () => { closeSide(); fmShow(true); }; $('filesBtn').onclick = () => fmShow(true);
+  $('appBtn').onclick = () => openApp(); $('openApp').onclick = () => { closeSide(); openApp(); };
   $('fmClose').onclick = () => { if (!fmDirty || confirm('Discard unsaved changes?')) { fmDirty = false; fmShow(false); } };
   $('fmNewFile').onclick = () => fmNew('file'); $('fmNewDir').onclick = () => fmNew('dir');
   $('fmUpload').onclick = () => $('fmFile').click();
