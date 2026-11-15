@@ -961,6 +961,27 @@ function installCmd(m, names, sudo) {
     default: return '';
   }
 }
+// Chromium needs shared libraries that minimal images do not ship (Vercel Sandbox is Amazon Linux 2023). Playwright's --with-deps only knows apt,
+// so on dnf/yum systems we install them ourselves. Without them Chrome dies silently and a screenshot never appears.
+const CHROME_LIBS_RPM = 'nss nspr atk at-spi2-atk at-spi2-core cups-libs libdrm libXcomposite libXdamage libXrandr libXfixes libXcursor libXext libXi libX11 libxcb libX11-xcb libxkbcommon mesa-libgbm pango cairo cairo-gobject alsa-lib gtk3 fontconfig dejavu-sans-fonts liberation-fonts google-noto-sans-fonts';
+const rpmManager = (p) => (p.have.dnf ? 'dnf' : p.have.yum ? 'yum' : null);
+const browserLibsCmd = (p, sudo) => { const m = rpmManager(p); return m ? `${sudo}${m} install -y --skip-broken ${CHROME_LIBS_RPM} && ${sudo}ldconfig` : ''; };
+function installBrowserLibs(ctx) {
+  const p = sysProbe(), sudo = p.root || !p.have.sudo ? '' : 'sudo -n ';
+  const cmd = browserLibsCmd(p, sudo);
+  if (!cmd) return Promise.resolve('No dnf/yum on this machine, so there is nothing to install.');
+  ctx?.emit?.('status', { text: 'Installing the libraries Chrome needs...' });
+  return shellRun(cmd, { cwd: HOME, timeout: 900000, signal: ctx?.signal });
+}
+// '' when Chrome starts and renders a blank page, otherwise the last lines of what it complained about
+function chromeLaunchProblem(chrome) {
+  try {
+    const r = spawnSync(chrome, ['--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--dump-dom', 'about:blank'], { encoding: 'utf8', timeout: 25000 });
+    const err = `${r.stderr || ''}${r.error ? r.error.message : ''}`;
+    if (/error while loading shared libraries|cannot open shared object/i.test(err) || (r.status !== 0 && !/<html/i.test(r.stdout || ''))) return err.trim().split('\n').slice(-4).join('\n') || `exit ${r.status}`;
+  } catch (e) { return e.message; }
+  return '';
+}
 async function ensureBrowser(ctx) {
   const found = findChrome();
   if (found) return `Browser already available: ${found}`;
@@ -974,6 +995,7 @@ async function ensureBrowser(ctx) {
   if (p.have.pacman) attempts.push(`${sudo}pacman -S --noconfirm chromium`);
   if (p.have.apk) attempts.push(`${sudo}apk add --no-cache chromium`);
   if (p.have.winget) attempts.push('winget install -e --id Google.Chrome --accept-package-agreements --accept-source-agreements');
+  { const libs = browserLibsCmd(p, sudo); if (libs) attempts.push(libs); } // dnf/yum: the shared libraries Chromium needs
   if (p.have.npx) {
     attempts.push(`npx -y playwright install ${p.have['apt-get'] && (p.root || p.have.sudo) ? '--with-deps ' : ''}chromium`);
     attempts.push(`npx -y @puppeteer/browsers install chrome-headless-shell@stable --path "${path.join(HOME, 'browsers')}"`);
@@ -987,6 +1009,9 @@ async function ensureBrowser(ctx) {
     report.push(`$ ${cmd}\n${out.length > 1200 ? `${out.slice(0, 400)}\n...\n${out.slice(-700)}` : out}`);
     if (hit) {
       process.env.CHROME_PATH = hit; process.env.PUPPETEER_EXECUTABLE_PATH = hit; process.env.CHROME_BIN = hit;
+      let problem = chromeLaunchProblem(hit);
+      if (problem && /shared librar|cannot open shared/i.test(problem)) { report.push(`$ install Chrome libraries\n${(await installBrowserLibs(ctx)).slice(-700)}`); problem = chromeLaunchProblem(hit); }
+      if (problem) return `Chrome is installed at ${hit} but does not start yet:\n${problem}\n\n${report.join('\n\n')}\n\nFix the cause above (missing libraries, no root) and try again.`;
       return `Browser ready: ${hit}\nPass it to tools as CHROME_PATH / executablePath / browserExecutable. The screenshot tool already uses it.\n\n${report.join('\n\n')}`;
     }
   }
@@ -1421,22 +1446,26 @@ Rules: SEARCH must be unique-ish and copied verbatim from read_file (indentation
     mutating: true,
     description: 'Screenshot a URL or local HTML file with headless Chrome (scripts run). Returns markdown image. If Chrome is missing, install_package ["chromium"] sets it up.',
     parameters: { type: 'object', properties: { url: { type: 'string', description: 'http(s) URL or workspace file path' }, width: { type: 'integer' }, height: { type: 'integer' }, full_page: { type: 'boolean' } }, required: ['url'] },
-    run: async ({ url, width = 1280, height = 900, full_page }) => {
-      const CHROME = findChrome();
-      if (!CHROME) throw new Error('No Chrome/Chromium found. Call install_package with names ["chromium"]: it tries apt/pkg/brew/playwright automatically. Then retry.');
+    run: async ({ url, width = 1280, height = 900 }, ctx) => {
+      let CHROME = findChrome();
+      if (!CHROME) { await ensureBrowser(ctx); CHROME = findChrome(); } // install it ourselves instead of hoping the model does
+      if (!CHROME) throw new Error('No Chrome/Chromium could be installed automatically. Call install_package with names ["chromium"] and read its errors.');
       const target = /^https?:\/\//i.test(url) ? url : (previewUp ? `http://127.0.0.1:${CFG.previewPort}/run/${PREVIEW_TOKEN}/${relPath(wsPath(url)).split('/').map(encodeURIComponent).join('/')}` : `file://${wsPath(url)}`);
       const out = wsPath(`images/shot_${newId(5)}.png`);
       fs.mkdirSync(path.dirname(out), { recursive: true });
-      const args = ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-swiftshader', '--virtual-time-budget=4000', `--window-size=${width},${height}`, `--screenshot=${out}`];
-      if (full_page) args.push('--screenshot-format=png');
-      args.push(target);
-      await new Promise((resolve, reject) => {
-        const p = spawn(CHROME, args, { stdio: 'ignore' });
-        p.on('error', reject);
-        p.on('close', () => resolve());
-        setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* ignore */ } resolve(); }, 45000);
+      const args = ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-sandbox', '--disable-dev-shm-usage', '--enable-unsafe-swiftshader', '--force-device-scale-factor=1', '--virtual-time-budget=4000', `--window-size=${width},${height}`, `--screenshot=${out}`, target];
+      const shoot = () => new Promise((resolve) => {
+        let err = '', done = false;
+        const finish = () => { if (done) return; done = true; clearTimeout(timer); resolve(err); };
+        const p = spawn(CHROME, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        const timer = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* ignore */ } finish(); }, 45000);
+        p.stderr.on('data', (d) => { err = (err + d).slice(-4000); });
+        p.on('error', (e) => { err += e.message; finish(); });
+        p.on('close', finish);
       });
-      if (!fs.existsSync(out)) throw new Error('Screenshot failed (page may not have loaded).');
+      let err = await shoot();
+      if (!fs.existsSync(out) && /shared librar|cannot open shared object/i.test(err)) { await installBrowserLibs(ctx); err = await shoot(); } // missing system libraries: install them and retry once
+      if (!fs.existsSync(out)) throw new Error(`Screenshot failed. Chrome said:\n${err.split('\n').map((l) => l.trim()).filter(Boolean).slice(-8).join('\n') || '(no output: the page may not have loaded)'}`);
       mapCache.at = 0;
       return `Screenshot of ${url}\n\n![screenshot](${fileUrl(out)})`;
     },
@@ -2926,15 +2955,42 @@ function serveFile(req, res, f, headers = {}) {
 // Scripts can run, while the preview cannot read Power Agent credentials or same-origin API responses.
 const PREVIEW_TOKEN = crypto.randomBytes(18).toString('base64url');
 const previewUrl = (req, rel) => `${publicBase(req)}/power-agent-preview/run/${PREVIEW_TOKEN}/${rel.split('/').map(encodeURIComponent).join('/')}`;
+// The preview iframe is sandboxed to an opaque origin (so generated pages cannot touch Power Agent's cookies). That breaks three things
+// generated apps rely on, and this block repairs them: (1) module scripts, fetch(), fonts and WebGL textures need CORS headers,
+// (2) localStorage/sessionStorage throw in an opaque origin, (3) links that start with "/" point at the site root instead of the project.
+const CORS = { 'access-control-allow-origin': '*', 'cross-origin-resource-policy': 'cross-origin' };
+const STORAGE_SHIM = '<script>(function(){function mk(){var d={};return{getItem:function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null},setItem:function(k,v){d[k]=String(v)},removeItem:function(k){delete d[k]},clear:function(){d={}},key:function(i){return Object.keys(d)[i]||null},get length(){return Object.keys(d).length}}}["localStorage","sessionStorage"].forEach(function(n){try{window[n].getItem("x")}catch(e){try{Object.defineProperty(window,n,{value:mk(),configurable:true})}catch(_){}}})})();</script>';
+function previewRoot(viaGateway, dirRel) {
+  const dir = dirRel && dirRel !== '.' ? dirRel.split('/').map(encodeURIComponent).join('/') + '/' : '';
+  return `${viaGateway ? '/power-agent-preview' : ''}/run/${PREVIEW_TOKEN}/${dir}`;
+}
+function previewRewriteHtml(html, root) {
+  html = html.replace(/(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\/(?!\/)/gi, (_, a, q) => a + q + root);
+  html = html.replace(/url\(\s*(["']?)\/(?!\/)/gi, (_, q) => 'url(' + q + root);
+  const m = /<head[^>]*>/i.exec(html);
+  return m ? html.slice(0, m.index + m[0].length) + STORAGE_SHIM + html.slice(m.index + m[0].length) : STORAGE_SHIM + html;
+}
+const previewRewriteCss = (css, root) => css.replace(/url\(\s*(["']?)\/(?!\/)/gi, (_, q) => 'url(' + q + root);
 function startPreviewServer() {
+  let siteDir = '.'; // folder of the last HTML page served: stylesheets use it to resolve url(/img.png)
   const server = http.createServer((req, res) => {
     try {
+      if (req.method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET, HEAD, OPTIONS', 'access-control-allow-headers': '*', 'access-control-max-age': '600' }); return res.end(); }
       const u = new URL(req.url, 'http://x'), m = u.pathname.match(/^\/run\/([^/]+)\/?(.*)$/);
       if (!m || m[1] !== PREVIEW_TOKEN) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('Not found'); }
       let f = wsPath(decodeURIComponent(m[2]) || '.');
       if (exists(f) && fs.statSync(f).isDirectory()) f = path.join(f, 'index.html');
-      if (!exists(f) || !fs.statSync(f).isFile()) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end(`Not found: ${decodeURIComponent(m[2])}`); }
-      serveFile(req, res, f);
+      if (!exists(f) || !fs.statSync(f).isFile()) { res.writeHead(404, { 'content-type': 'text/plain', ...CORS }); return res.end(`Not found: ${decodeURIComponent(m[2])}`); }
+      const ext = path.extname(f).toLowerCase(), viaGateway = !!req.headers['x-forwarded-host']; // the screenshot tool talks to this port directly
+      if (ext === '.html' || ext === '.htm' || ext === '.css') {
+        let text = fs.readFileSync(f, 'utf8');
+        if (ext === '.css') text = previewRewriteCss(text, previewRoot(viaGateway, siteDir));
+        else { siteDir = path.posix.dirname(relPath(f)); text = previewRewriteHtml(text, previewRoot(viaGateway, siteDir)); }
+        const body = Buffer.from(text, 'utf8');
+        res.writeHead(200, { 'content-type': MIME[ext], 'content-length': body.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...CORS });
+        return req.method === 'HEAD' ? res.end() : res.end(body);
+      }
+      serveFile(req, res, f, CORS);
     } catch (e) { res.writeHead(400, { 'content-type': 'text/plain' }); res.end(e.message); }
   });
   return new Promise((resolve) => {
