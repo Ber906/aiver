@@ -529,6 +529,10 @@ const DEFAULTS = {
 };
 const AUTO_BUDGET = 200000;                 // starting point when tokenBudget = 0 (auto)
 const learnedBudget = new Map();            // model -> real limit learned from provider errors
+const noTools = new Map();                  // model -> timestamp until which tool calling is skipped (its provider keeps failing with tools attached)
+const NO_TOOLS_MS = 10 * 60_000;
+const toolsOff = (m) => (noTools.get(m) || 0) > Date.now();
+const briefWhy = (e) => String((e && e.message) || '').replace(/\s+/g, ' ').trim().slice(0, 140);
 const effBudget = (s) => (s.tokenBudget > 0 ? s.tokenBudget : AUTO_BUDGET);
 function getSettings() {
   const s = { ...DEFAULTS, ...readJson(SETTINGS_FILE, {}) };
@@ -2615,16 +2619,17 @@ async function runAgent(conv, userText, emit, signal, opts = {}) {
 
   const build = (extra = [], withTools = true) => {
     const history = trimHistory(conv.messages, Math.max(4000, budget - 12000));
-    const sys = systemPrompt(settings, userText, conv, opts.depth || 0) + (conv.summary ? `\n\n## Earlier in this session (summary)\n${conv.summary}` : '');
+    const sys = systemPrompt(settings, userText, conv, opts.depth || 0) + (conv.summary ? `\n\n## Earlier in this session (summary)\n${conv.summary}` : '')
+      + (withTools ? '' : '\n\n## Tools unavailable\nTool calling is unavailable for this reply. Answer directly in plain text and never emit tool calls. If the task needs tools, say so briefly and suggest switching to a model that supports tool calling.');
     return {
       model: settings.model || 'auto',
-      temperature: settings.temperature,
+      ...(noTemp ? {} : { temperature: settings.temperature }),
       messages: [{ role: 'system', content: sys }, ...history.map(forModel), ...extra],
       ...(withTools ? { tools: toolSchemas(settings, opts.toolAllow), tool_choice: 'auto' } : {}),
     };
   };
 
-  let useTools = true, carry = '', extra = [], contCount = 0, overflowRetries = 0, transientTries = 0, streamResumeTries = 0, nudges = 0, fbIdx = 0, stalled = false, gaveUp = false, toolCount = 0;
+  let useTools = !toolsOff(baseModel), toolFails = 0, plainFails = 0, noTemp = false, probing = false, carry = '', extra = [], contCount = 0, overflowRetries = 0, transientTries = 0, streamResumeTries = 0, nudges = 0, fbIdx = 0, stalled = false, gaveUp = false, toolCount = 0;
   const recent = [];
   for (let step = 1; step <= limit; step++) {
     if (signal.aborted) throw new Error('Stopped.');
@@ -2687,16 +2692,33 @@ async function runAgent(conv, userText, emit, signal, opts = {}) {
         step--; continue;
       }
       // 2) model has no tool support
-      if (useTools && e.status && e.status < 500 && /tool|function/i.test(e.message)) {
+      if (useTools && e.status >= 400 && e.status !== 429 && /tool|function/i.test(e.message)) {
         useTools = false; step--; emit('status', { text: 'Model lacks tool support, retrying as plain chat...' }); continue;
       }
       // 3) Recover from short network/provider interruptions before any tool is executed.
       if (isTransient(e)) {
+        // The agent attaches ~43 tool schemas to every request; the FreeLLMAPI chat sends none. When the routed provider keeps
+        // answering 5xx only with tools attached, stop looping on the same request: answer as plain chat instead.
+        if (!content && e.status >= 500) {
+          if (useTools && ++toolFails >= 2) {
+            useTools = false; probing = true; transientTries = 0;
+            err(`LLM ${e.status} on ${settings.model} with tools attached (${briefWhy(e)}). Retrying as plain chat.`);
+            emit('status', { text: 'Provider keeps failing with tools attached, retrying as plain chat...' });
+            step--; continue;
+          }
+          if (!useTools && !noTemp && ++plainFails >= 2) {
+            noTemp = true; transientTries = 0;
+            emit('status', { text: 'Still failing, retrying with a minimal request...' });
+            step--; continue;
+          }
+        }
         if (!content && transientTries < 7) {
           transientTries++;
           const base = Math.min(30000, e.retryAfterMs ?? 500 * 2 ** (transientTries - 1));
           const wait = Math.min(30000, base + (e.retryAfterMs ? 0 : Math.random() * Math.min(1000, base * 0.25)));
-          emit('status', { text: `Provider busy (${e.status || 'network'}), retrying in ${Math.max(1, Math.ceil(wait / 1000))}s...` });
+          const why = briefWhy(e);
+          if (transientTries === 1) err(`LLM ${e.status || 'network'} on ${settings.model}: ${why || '(no message)'}`);
+          emit('status', { text: `Provider busy (${e.status || 'network'}${why ? `: ${why}` : ''}), retrying in ${Math.max(1, Math.ceil(wait / 1000))}s...` });
           await sleep(wait, signal); step--; continue;
         }
         if (content && streamResumeTries < 2) {
@@ -2722,11 +2744,17 @@ async function runAgent(conv, userText, emit, signal, opts = {}) {
           emit('status', { text: `Failing over to ${fb}...` });
           settings = { ...settings, model: fb }; ctx.settings = settings;
           budget = learnedBudget.get(fb) || effBudget(settings); transientTries = 0; streamResumeTries = 0;
+          useTools = !toolsOff(fb); toolFails = 0; plainFails = 0; noTemp = false; probing = false;
           step--; continue;
         }
       }
       throw e;
     }
+    if (probing && !noTemp) {
+      noTools.set(settings.model, Date.now() + NO_TOOLS_MS);
+      emit('status', { text: `${settings.model} rejects tool calls through FreeLLMAPI right now, so this reply is plain chat. Pick another model for agent work.` });
+    }
+    probing = false; toolFails = 0; plainFails = 0;
     transientTries = 0; overflowRetries = 0; streamResumeTries = 0;
 
     const calls = [...acc.entries()].filter(([, c]) => c.name).sort((a, b) => a[0] - b[0]).map(([i, c], n) => ({
